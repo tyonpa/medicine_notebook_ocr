@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,18 +14,60 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 NDLOCR_LITE_DIR = Path(os.getenv("NDLOCR_LITE_DIR", str(ROOT_DIR / "ndlocr-lite"))).resolve()
 NDLOCR_SRC_DIR = NDLOCR_LITE_DIR / "src"
 NDLOCR_PYTHON = os.getenv("NDLOCR_PYTHON", sys.executable)
-NDLOCR_TIMEOUT = float(os.getenv("NDLOCR_TIMEOUT", "900"))
+
+
+def positive_env_number(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+NDLOCR_TIMEOUT = positive_env_number("NDLOCR_TIMEOUT", 900.0)
+MAX_OCR_UPLOAD_BYTES = int(positive_env_number("MAX_OCR_UPLOAD_BYTES", 50 * 1024 * 1024))
+UPLOAD_CHUNK_SIZE = 1024 * 1024
 
 app = FastAPI(title="NDLOCR-Lite subprocess API")
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    ocr_script = NDLOCR_SRC_DIR / "ocr.py"
+    return {
+        "status": "ok" if ocr_script.exists() else "degraded",
+        "ocr_script": "available" if ocr_script.exists() else "missing",
+    }
+
+
+def save_upload_file(upload: UploadFile, destination: Path) -> int:
+    total_size = 0
+    try:
+        with destination.open("wb") as output:
+            while chunk := upload.file.read(UPLOAD_CHUNK_SIZE):
+                total_size += len(chunk)
+                if total_size > MAX_OCR_UPLOAD_BYTES:
+                    limit_mb = max(
+                        1,
+                        (MAX_OCR_UPLOAD_BYTES + 1024 * 1024 - 1) // (1024 * 1024),
+                    )
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"uploaded image exceeds {limit_mb}MB",
+                    )
+                output.write(chunk)
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="failed to save uploaded image") from exc
+
+    if total_size == 0:
+        raise HTTPException(status_code=400, detail="uploaded image is empty")
+    return total_size
 
 
 @app.post("/ocr")
-async def ocr_image(
+def ocr_image(
     file: UploadFile = File(...),
     device: str = Form("cpu"),
 ) -> dict[str, Any]:
@@ -41,8 +82,7 @@ async def ocr_image(
         output_dir = temp_path / "output"
         output_dir.mkdir()
 
-        with input_path.open("wb") as wf:
-            shutil.copyfileobj(file.file, wf)
+        save_upload_file(file, input_path)
 
         command = [
             NDLOCR_PYTHON,
@@ -60,6 +100,8 @@ async def ocr_image(
                 cwd=str(NDLOCR_SRC_DIR),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=NDLOCR_TIMEOUT,
                 check=False,
             )
@@ -94,11 +136,32 @@ async def ocr_image(
 
         json_data: dict[str, Any] | None = None
         if json_path.exists():
-            json_data = json.loads(json_path.read_text(encoding="utf-8"))
+            try:
+                parsed_json = json.loads(json_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail="NDLOCR-Lite produced invalid JSON output",
+                ) from exc
+            if isinstance(parsed_json, dict):
+                json_data = parsed_json
+
+        try:
+            ocr_text = txt_path.read_text(encoding="utf-8", errors="replace")
+            xml_text = (
+                xml_path.read_text(encoding="utf-8", errors="replace")
+                if xml_path.exists()
+                else ""
+            )
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="failed to read NDLOCR-Lite output",
+            ) from exc
 
         return {
-            "ocr_text": txt_path.read_text(encoding="utf-8"),
-            "xml_text": xml_path.read_text(encoding="utf-8") if xml_path.exists() else "",
+            "ocr_text": ocr_text,
+            "xml_text": xml_text,
             "json": json_data,
             "stdout": completed.stdout,
             "stderr": completed.stderr,
