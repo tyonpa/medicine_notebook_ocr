@@ -1,0 +1,3 @@
+[client]
+# 右上のDeployボタンとメニューを表示しない。
+toolbarMode = "minimal"

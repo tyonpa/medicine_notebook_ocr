@@ -36,6 +36,15 @@ streamlit run app/app.py
 - OCR API のデフォルト接続先は `OCR_API_URL=http://127.0.0.1:8001`
 - `ndlocr-lite` の配置先を変える場合は OCR API 側で `NDLOCR_LITE_DIR` を設定すること
 
+## 読み取りログ
+
+読み取り結果は `log/YYYY-MM-DD.jsonl`（`LOG_DIR` で変更可）に1行1レコードの JSON Lines で追記されます。患者IDと服薬情報を含むため、ファイル権限は 0600 で作成し、Git の管理対象外にしています。
+
+- `event: "analysis"`: OCR・AI解析の完了時。`timestamp`, `record_id`, `patient_id`, `ocr_text`, `extracted_text_raw`（LLMの生出力）, `model_name`, `processing_seconds`, `image_sha256`
+- `event: "qr"`: QR表示時（内容が変わるたびに1行）。`timestamp`, `record_id`, `patient_id`, `extracted_text_edited`（編集後のお薬情報）, `qr_text`, `patient_id_in_qr`, `qr_generated`
+
+同じ読み取りの2種類のレコードは `record_id` で結合できます（例: `pandas.read_json(path, lines=True)`, `jsonlite::stream_in(file(path))`）。
+
 ## ライセンス
 
 本アプリはOCR処理にNDLOCR-Liteを利用しています。

@@ -10,9 +10,12 @@ import re
 import threading
 import time
 import unicodedata
+import uuid
 import warnings
 from dotenv import load_dotenv
 from dataclasses import dataclass
+from datetime import datetime
+from html import escape
 from pathlib import Path
 
 import qrcode
@@ -52,12 +55,18 @@ MAX_OCR_PIXELS = positive_env_int("MAX_OCR_PIXELS", 12_000_000)
 MAX_OCR_DIMENSION = positive_env_int("MAX_OCR_DIMENSION", 3_200)
 APP_DIR = Path(__file__).resolve().parent
 PROMPT_PATH = APP_DIR / "prompt.txt"
+LOG_DIR = Path(os.getenv("LOG_DIR") or APP_DIR.parent / "log")
+LOG_WRITE_LOCK = threading.Lock()
 LOGGER = logging.getLogger(__name__)
 INDEX_PREFIX_PATTERN = re.compile(r"^\s*\[\s*\d+\s*\]\s*")
 DOSAGE_PATTERN = re.compile(
     r"^(?P<name>.+?)\s+1\s*日\s*(?P<amount>[0-9０-９]+(?:[.．][0-9０-９]+)?)\s*(?P<unit>\S.*)$"
 )
 NO_MEDICINE_PHRASES = ("該当なし", "ありません", "抽出できません", "見つかりません")
+PERSISTED_WIDGET_KEYS = (
+    ("patient_id_input", "patient_id"),
+    ("include_patient_id_toggle", "include_patient_id_in_qr"),
+)
 
 
 class AppError(RuntimeError):
@@ -317,6 +326,63 @@ def clear_analysis_results() -> None:
     st.session_state.qr_text = ""
     st.session_state.medicine_entries = []
     st.session_state.processing_seconds = None
+    st.session_state.log_record_id = ""
+    st.session_state.last_logged_qr_signature = None
+
+
+def append_reading_log(record: dict[str, object]) -> None:
+    """読み取りログを日次のJSON Linesファイルへ1行追記する。"""
+    timestamp = datetime.now().astimezone()
+    entry = {"timestamp": timestamp.isoformat(timespec="seconds"), **record}
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+    log_path = LOG_DIR / f"{timestamp:%Y-%m-%d}.jsonl"
+    # Streamlitのセッションは同一プロセス内のスレッドで動くため、プロセス内ロックで追記を直列化する。
+    with LOG_WRITE_LOCK:
+        LOG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8", newline="\n") as log_file:
+            log_file.write(line)
+
+
+def write_reading_log(record: dict[str, object]) -> bool:
+    try:
+        append_reading_log(record)
+    except (OSError, TypeError, ValueError):
+        LOGGER.exception("Failed to write reading log")
+        st.session_state.log_warning = "読み取りログを保存できませんでした。ログの保存先を確認してください。"
+        return False
+    return True
+
+
+def get_patient_id() -> str:
+    return str(st.session_state.patient_id).strip()
+
+
+def restore_widget_value(widget_key: str, store_key: str) -> None:
+    """ページ遷移で消えるウィジェットの値を、保存しておいた値から復元する。"""
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = st.session_state[store_key]
+
+
+def persist_widget_values() -> None:
+    for widget_key, store_key in PERSISTED_WIDGET_KEYS:
+        if widget_key in st.session_state:
+            st.session_state[store_key] = st.session_state[widget_key]
+
+
+def start_new_entry() -> None:
+    clear_analysis_results()
+    st.session_state.input_image_png = b""
+    st.session_state.input_image_resized = False
+    st.session_state.input_image_original_size = None
+    st.session_state.input_image_fingerprint = ""
+    # キーを変えて、画像入力ウィジェットに残っている前回の画像を破棄する。
+    st.session_state.input_widget_version += 1
+    for widget_key, _ in PERSISTED_WIDGET_KEYS:
+        st.session_state.pop(widget_key, None)
+    st.session_state.patient_id = ""
+    st.session_state.include_patient_id_in_qr = False
+    st.session_state.current_page = 1
 
 
 def adjust_medicine_amount(entry_id: int, delta: int) -> None:
@@ -381,14 +447,22 @@ def render_page_navigation(current_page: int, can_go_next: bool) -> None:
                 args=(current_page - 1,),
             )
         with next_col:
-            st.button(
-                "次へ →",
-                key=f"page_next_{current_page}",
-                disabled=current_page == 3 or not can_go_next,
-                use_container_width=True,
-                on_click=go_to_page,
-                args=(current_page + 1,),
-            )
+            if current_page == 3:
+                st.button(
+                    "新規",
+                    key="page_new",
+                    use_container_width=True,
+                    on_click=start_new_entry,
+                )
+            else:
+                st.button(
+                    "次へ →",
+                    key=f"page_next_{current_page}",
+                    disabled=not can_go_next,
+                    use_container_width=True,
+                    on_click=go_to_page,
+                    args=(current_page + 1,),
+                )
 
 
 def make_qr_image(text: str) -> Image.Image:
@@ -575,6 +649,32 @@ def main():
             margin-bottom: .65rem;
         }
         .app-hero h1 { margin: 0; font-size: 1.65rem; font-weight: 750; }
+        /* st.htmlにはst.markdownの見出し余白と下方向の詰め(-1rem)が付かないため、同じ見た目になるよう補う。 */
+        .app-hero h1 { padding: 1.25rem 0 1rem; line-height: 1.2; }
+        .app-hero {
+            margin-bottom: -.35rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+        }
+        /* 上部ヘッダーは消し、サイドバーを閉じたときはタイトル帯の設定ボタンから開く。 */
+        header[data-testid="stHeader"] { display: none; }
+        .app-hero-settings {
+            flex: 0 0 auto;
+            padding: .4rem .95rem;
+            border: 1px solid rgba(255, 255, 255, .55);
+            border-radius: 8px;
+            color: white;
+            background: rgba(255, 255, 255, .14);
+            font: inherit;
+            font-weight: 700;
+            cursor: pointer;
+        }
+        .app-hero-settings:hover { background: rgba(255, 255, 255, .26); }
+        body:has(section[data-testid="stSidebar"][aria-expanded="true"]) .app-hero-settings {
+            display: none;
+        }
         .workflow-step {
             display: flex;
             align-items: center;
@@ -618,13 +718,12 @@ def main():
         div[class*="st-key-medicine_row_"] div[data-baseweb="input"] {
             min-height: 40px;
         }
+        /* 下部に固定したページ移動ボタンと重ならない高さにし、はみ出した分はスクロールさせる。 */
         div[class*="st-key-app_page_"] {
-            height: calc(100vh - 205px);
-            overflow: hidden;
-        }
-        div.st-key-app_page_2 {
+            height: calc(100vh - 260px);
+            flex: 0 0 auto;
             overflow-y: auto;
-            padding-bottom: 4rem;
+            padding-bottom: .5rem;
         }
         div.st-key-page_navigation {
             position: absolute;
@@ -660,6 +759,15 @@ def main():
             background: #edfafa;
             color: #174f56;
         }
+        .qr-patient-id {
+            width: 280px;
+            line-height: 1.6;
+            text-align: center;
+            color: #183b45;
+            font-size: 1.1rem;
+            font-weight: 700;
+            overflow-wrap: anywhere;
+        }
         @media (max-width: 760px) {
             .workflow-step { min-height: 46px; padding: .5rem; }
             .workflow-step strong { display: none; }
@@ -669,13 +777,25 @@ def main():
         """,
         unsafe_allow_html=True,
     )
-    st.markdown(
+    st.html(
         """
         <div class="app-hero">
             <h1>お薬手帳 OCR</h1>
+            <button class="app-hero-settings" type="button">⚙ 設定</button>
         </div>
+        <script>
+        // 再描画でスクリプトが再実行されても、クリック処理は1回だけ登録する。
+        if (!window.medicineOcrSettingsBound) {
+            window.medicineOcrSettingsBound = true;
+            document.addEventListener("click", (event) => {
+                if (event.target.closest(".app-hero-settings")) {
+                    document.querySelector('[data-testid="stExpandSidebarButton"]')?.click();
+                }
+            });
+        }
+        </script>
         """,
-        unsafe_allow_html=True,
+        unsafe_allow_javascript=True,
     )
 
     if "summary_text" not in st.session_state:
@@ -710,6 +830,19 @@ def main():
         st.session_state.llm_api_key = DEFAULT_OPENAI_API_KEY
     if "llm_model_name" not in st.session_state:
         st.session_state.llm_model_name = DEFAULT_OPENAI_MODEL_NAME
+    if "input_widget_version" not in st.session_state:
+        st.session_state.input_widget_version = 0
+    if "patient_id" not in st.session_state:
+        st.session_state.patient_id = ""
+    if "include_patient_id_in_qr" not in st.session_state:
+        st.session_state.include_patient_id_in_qr = False
+    if "log_record_id" not in st.session_state:
+        st.session_state.log_record_id = ""
+    if "last_logged_qr_signature" not in st.session_state:
+        st.session_state.last_logged_qr_signature = None
+    if "log_warning" not in st.session_state:
+        st.session_state.log_warning = ""
+    persist_widget_values()
 
     current_page = int(st.session_state.current_page)
     render_workflow_steps(current_page)
@@ -769,6 +902,10 @@ def main():
 
     can_go_next = False
     with st.container(border=False, key=f"app_page_{current_page}"):
+        if st.session_state.log_warning:
+            st.warning(st.session_state.log_warning)
+            st.session_state.log_warning = ""
+
         if current_page == 1:
             st.markdown("<h2 class='section-heading'>画像を選ぶ</h2>", unsafe_allow_html=True)
             input_col, preview_col = st.columns([1, 1], vertical_alignment="top")
@@ -784,15 +921,27 @@ def main():
                     )
                     camera_image = None
                     uploaded_file = None
+                    input_widget_version = st.session_state.input_widget_version
                     if input_method == "カメラで撮影":
                         camera_image = st.camera_input(
-                            "お薬手帳を撮影", label_visibility="collapsed"
+                            "お薬手帳を撮影",
+                            label_visibility="collapsed",
+                            key=f"camera_input_{input_widget_version}",
                         )
                     else:
                         uploaded_file = st.file_uploader(
                             "お薬手帳の画像を選択",
                             type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"],
+                            key=f"image_uploader_{input_widget_version}",
                         )
+
+                with st.container(border=True):
+                    restore_widget_value("patient_id_input", "patient_id")
+                    st.text_input(
+                        "患者ID（任意）",
+                        key="patient_id_input",
+                    )
+                    st.session_state.patient_id = st.session_state.patient_id_input
 
             source_file = camera_image or uploaded_file
             preview_image = None
@@ -889,6 +1038,19 @@ def main():
                         st.session_state.processing_seconds = processing_seconds
                         replace_medicine_entries(summary_text)
                         sync_medicine_entries_from_widgets()
+                        st.session_state.log_record_id = uuid.uuid4().hex
+                        write_reading_log(
+                            {
+                                "event": "analysis",
+                                "record_id": st.session_state.log_record_id,
+                                "patient_id": get_patient_id(),
+                                "ocr_text": ocr_text,
+                                "extracted_text_raw": summary_text,
+                                "model_name": model_name.strip(),
+                                "processing_seconds": round(processing_seconds, 3),
+                                "image_sha256": st.session_state.input_image_fingerprint,
+                            }
+                        )
                         st.session_state.current_page = 2
                         st.rerun()
 
@@ -929,37 +1091,64 @@ def main():
 
         else:
             sync_medicine_entries_from_widgets()
-            current_summary = st.session_state.qr_text
+            medicine_text = st.session_state.qr_text
+            patient_id = get_patient_id()
             st.markdown("<h2 class='section-heading'>QRを表示</h2>", unsafe_allow_html=True)
             if st.session_state.processing_seconds is not None:
                 st.caption(f"解析時間: {st.session_state.processing_seconds:.1f}秒")
 
-            if current_summary:
+            if medicine_text:
+                qr_col, detail_col = st.columns([1, 2], vertical_alignment="center")
+                with detail_col:
+                    # トグルの値でQRの内容が決まるため、上に置く要素は後から描画する枠だけ先に確保する。
+                    status_slot = st.container()
+                    content_slot = st.container()
+                    restore_widget_value("include_patient_id_toggle", "include_patient_id_in_qr")
+                    st.toggle(
+                        "QRコードに患者IDを含める",
+                        key="include_patient_id_toggle",
+                        disabled=not patient_id,
+                        help="オンにすると、QRコードの先頭行に患者IDを入れます。",
+                    )
+                    st.session_state.include_patient_id_in_qr = st.session_state.include_patient_id_toggle
+                    download_slot = st.container()
+                include_patient_id = bool(st.session_state.include_patient_id_in_qr and patient_id)
+                current_summary = f"{patient_id}\n{medicine_text}" if include_patient_id else medicine_text
+
                 try:
                     qr_image = make_qr_image(current_summary)
                 except QrGenerationError as exc:
-                    st.error(str(exc))
-                    st.download_button(
-                        "テキストを保存",
-                        data=current_summary.encode("utf-8"),
-                        file_name="medicine_summary.txt",
-                        mime="text/plain",
-                    )
+                    qr_image = None
+                    with status_slot:
+                        st.error(str(exc))
+                    with download_slot:
+                        st.download_button(
+                            "テキストを保存",
+                            data=current_summary.encode("utf-8"),
+                            file_name="medicine_summary.txt",
+                            mime="text/plain",
+                        )
                 else:
-                    qr_col, download_col = st.columns([1, 2], vertical_alignment="center")
                     with qr_col:
                         st.image(qr_image, caption="お薬情報のQRコード", width=280)
-                    with download_col:
+                        if patient_id:
+                            st.markdown(
+                                f"<div class='qr-patient-id'>患者ID: {escape(patient_id)}</div>",
+                                unsafe_allow_html=True,
+                            )
+                    with status_slot:
                         st.markdown(
                             "<div class='qr-panel'><strong>QRコードの準備ができました</strong></div>",
                             unsafe_allow_html=True,
                         )
+                    with content_slot:
                         st.text_area(
                             "QRコードに含まれる内容",
                             current_summary,
                             height=150,
                             disabled=True,
                         )
+                    with download_slot:
                         download_qr_col, download_text_col = st.columns(2)
                         with download_qr_col:
                             st.download_button(
@@ -977,6 +1166,25 @@ def main():
                                 mime="text/plain",
                                 use_container_width=True,
                             )
+
+                # 再描画のたびに記録しないよう、内容が変わったときだけ記録する。
+                qr_log_signature = (st.session_state.log_record_id, patient_id, current_summary)
+                if qr_log_signature != st.session_state.last_logged_qr_signature:
+                    if write_reading_log(
+                        {
+                            "event": "qr",
+                            "record_id": st.session_state.log_record_id,
+                            "patient_id": patient_id,
+                            "extracted_text_edited": medicine_text,
+                            "qr_text": current_summary,
+                            "patient_id_in_qr": include_patient_id,
+                            "qr_generated": qr_image is not None,
+                        }
+                    ):
+                        st.session_state.last_logged_qr_signature = qr_log_signature
+                    elif st.session_state.log_warning:
+                        st.warning(st.session_state.log_warning)
+                        st.session_state.log_warning = ""
 
     render_page_navigation(current_page, can_go_next)
 
