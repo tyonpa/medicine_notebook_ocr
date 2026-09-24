@@ -35,6 +35,79 @@ streamlit run app/app.py
 - `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL_NAME` を設定すると、サイドバー入力欄の初期値として使われる
 - OCR API のデフォルト接続先は `OCR_API_URL=http://127.0.0.1:8001`
 - `ndlocr-lite` の配置先を変える場合は OCR API 側で `NDLOCR_LITE_DIR` を設定すること
+- Streamlit はリポジトリ直下から起動すること（`.streamlit/config.toml` は起動したディレクトリから読み込まれる）
+
+## システム構成
+
+構成図・処理シーケンス・コンポーネント一覧・データの保存先をまとめたページを [docs/system_architecture.html](docs/system_architecture.html) に置いています（ブラウザでローカルに開けます。図の描画に Mermaid を CDN から読み込むため、表示にはインターネット接続が必要です）。
+
+```mermaid
+flowchart TB
+    U["利用者の端末（ブラウザ）<br/>カメラ撮影 / 画像選択・患者ID入力<br/>お薬情報の編集・QR表示 / 保存"]
+
+    subgraph Host["ローカルPC"]
+        direction TB
+        subgraph ST["Streamlit アプリ：app/app.py（既定 :8501）"]
+            direction LR
+            PRE["画像前処理<br/>EXIF回転補正・縮小（Pillow）"]
+            UI["3ページUI<br/>画像を選ぶ → 内容を確認 → QRを表示"]
+            QR["QRコード生成<br/>（qrcode）"]
+            LOGW["読み取りログ書き込み"]
+        end
+        CFG[(".env / .streamlit/config.toml<br/>app/prompt.txt")]
+        LOG[("log/YYYY-MM-DD.jsonl<br/>権限 0600")]
+        subgraph API["OCR API：app/ocr_api.py（FastAPI + uvicorn、127.0.0.1:8001）"]
+            EP["POST /ocr ・ GET /health"]
+        end
+        TMP[("一時ディレクトリ<br/>入力PNG・txt / xml / json")]
+        subgraph NDL["NDLOCR-Lite：ndlocr-lite/src/ocr.py（subprocess）"]
+            direction LR
+            L1["レイアウト認識<br/>DEIMv2（ONNX）"] --> L2["文字列認識<br/>PARSeq（ONNX）"] --> L3["読み順整序<br/>xy_cut"]
+        end
+    end
+
+    LLM["OpenAI互換 LLM API<br/>Responses API（OPENAI_BASE_URL）"]
+
+    U <-->|"HTTP / WebSocket"| UI
+    CFG -.->|設定の読み込み| ST
+    UI --> PRE
+    PRE -->|"PNG + device（multipart）"| EP
+    EP -->|"ocr_text, xml_text"| UI
+    EP -->|"python ocr.py --sourceimg ... --device cpu/cuda"| NDL
+    EP --> TMP
+    NDL --> TMP
+    UI <-->|"prompt.txt + OCRテキスト ⇄ お薬抽出テキスト"| LLM
+    UI --> QR
+    UI --> LOGW --> LOG
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as 利用者（ブラウザ）
+    participant App as Streamlit（app.py）
+    participant OCR as OCR API（ocr_api.py）
+    participant NDL as NDLOCR-Lite（ocr.py）
+    participant LLM as OpenAI互換 LLM API
+    participant Log as log/*.jsonl
+
+    User->>App: 画像選択・患者ID入力
+    App->>App: 画像前処理（EXIF補正・画素数上限で縮小）
+    User->>App: 「OCR・AI解析を実行」
+    App->>OCR: POST /ocr（PNG, device）
+    OCR->>NDL: subprocess 実行（タイムアウト 900秒）
+    NDL-->>OCR: txt / xml / json（一時ディレクトリ）
+    OCR-->>App: ocr_text, xml_text
+    App->>LLM: responses.create（prompt.txt + OCRテキスト、temperature=0）
+    LLM-->>App: お薬抽出テキスト（[n] 薬名 1日量）
+    App->>Log: event="analysis"（OCRテキスト・LLMの生出力 等）
+    User->>App: 内容を確認・編集
+    User->>App: 「次へ」
+    App->>App: QRコード生成（トグルがオンなら先頭行に患者ID）
+    App->>Log: event="qr"（編集後テキスト・QRの内容。内容が変わったときのみ）
+    App-->>User: QR表示・PNG/テキストのダウンロード
+    User->>App: 「新規」→ 状態を初期化して1ページ目へ
+```
 
 ## 読み取りログ
 
