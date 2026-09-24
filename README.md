@@ -39,8 +39,6 @@ streamlit run app/app.py
 
 ## システム構成
 
-構成図・処理シーケンス・コンポーネント一覧・データの保存先をまとめたページを [docs/system_architecture.html](docs/system_architecture.html) に置いています（ブラウザでローカルに開けます。図の描画に Mermaid を CDN から読み込むため、表示にはインターネット接続が必要です）。
-
 ```mermaid
 flowchart TB
     U["利用者の端末（ブラウザ）<br/>カメラ撮影 / 画像選択・患者ID入力<br/>お薬情報の編集・QR表示 / 保存"]
