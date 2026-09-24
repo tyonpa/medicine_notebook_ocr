@@ -938,7 +938,7 @@ def main():
                 with st.container(border=True):
                     restore_widget_value("patient_id_input", "patient_id")
                     st.text_input(
-                        "患者ID（任意）",
+                        "受付番号（任意）",
                         key="patient_id_input",
                     )
                     st.session_state.patient_id = st.session_state.patient_id_input
@@ -1105,10 +1105,10 @@ def main():
                     content_slot = st.container()
                     restore_widget_value("include_patient_id_toggle", "include_patient_id_in_qr")
                     st.toggle(
-                        "QRコードに患者IDを含める",
+                        "QRコードに受付番号を含める",
                         key="include_patient_id_toggle",
                         disabled=not patient_id,
-                        help="オンにすると、QRコードの先頭行に患者IDを入れます。",
+                        help="オンにすると、QRコードの先頭行に受付番号を入れます。",
                     )
                     st.session_state.include_patient_id_in_qr = st.session_state.include_patient_id_toggle
                     download_slot = st.container()
@@ -1133,7 +1133,7 @@ def main():
                         st.image(qr_image, caption="お薬情報のQRコード", width=280)
                         if patient_id:
                             st.markdown(
-                                f"<div class='qr-patient-id'>患者ID: {escape(patient_id)}</div>",
+                                f"<div class='qr-patient-id'>受付番号: {escape(patient_id)}</div>",
                                 unsafe_allow_html=True,
                             )
                     with status_slot:
