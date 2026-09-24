@@ -11,6 +11,7 @@ import threading
 import time
 import unicodedata
 import warnings
+from dotenv import load_dotenv
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,6 +38,8 @@ def positive_env_float(name: str, default: float) -> float:
         return default
     return value if value > 0 else default
 
+
+load_dotenv()
 
 DEFAULT_OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
 DEFAULT_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -721,17 +724,20 @@ def main():
             "API URL",
             key="llm_api_url",
             placeholder="http://127.0.0.1:8080/v1",
+            value = st.session_state.llm_api_url
         )
         api_key = st.text_input(
             "API Key",
             key="llm_api_key",
             type="password",
             placeholder="OpenAI互換APIのキー",
+            value = st.session_state.llm_api_key
         )
         model_name = st.text_input(
             "Model Name",
             key="llm_model_name",
             placeholder="モデル名",
+            value = st.session_state.llm_model_name
         )
         with st.expander("詳細データ・接続情報"):
             st.download_button(
